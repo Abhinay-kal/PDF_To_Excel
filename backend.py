@@ -6,97 +6,119 @@ import pandas as pd
 import re
 import os
 
-# --- 1. SIMPLE PRE-PROCESSING ---
+# --- 1. PRE-PROCESSING (No changes) ---
 def get_vertical_strips(image_pil):
-    # 1. High DPI Conversion happen at load time, here we just convert to array
     img = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
-    
-    # 2. Grayscale only (NO Thresholding - this fixes the "0 blobs" issue)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
     img_h, img_w = gray.shape
     col_w = img_w // 3
     
-    # 3. Blind Slice into 3 vertical strips
-    # We add 10px overlap to ensure we don't cut a letter in half
-    strip_1 = gray[0:img_h, 0 : col_w + 10]
-    strip_2 = gray[0:img_h, col_w - 10 : col_w * 2 + 10]
-    strip_3 = gray[0:img_h, col_w * 2 - 10 : img_w]
-    
-    return [strip_1, strip_2, strip_3]
+    # 3 strips with slight overlap
+    strips = [
+        gray[0:img_h, 0 : col_w + 10],
+        gray[0:img_h, col_w - 10 : col_w * 2 + 10],
+        gray[0:img_h, col_w * 2 - 10 : img_w]
+    ]
+    return strips
 
-# --- 2. ROBUST PARSING ---
-def parse_raw_text_block(text):
-    """
-    Splits a long string of text into voter chunks using the ID as a separator.
-    """
-    voters = []
-    
-    # Regex to find Voter IDs (Start of a new record)
-    # Matches: 3 Letters + 7 Digits (e.g., SMV0334946)
-    # We use capturing group () to keep the ID in the split list
-    split_data = re.split(r'([A-Z]{3}\d{7})', text)
-    
-    # split_data will look like: [trash, ID_1, Data_1, ID_2, Data_2, ...]
-    # We step through 2 items at a time
-    for i in range(1, len(split_data) - 1, 2):
-        v_id = split_data[i].strip()
-        v_data = split_data[i+1].strip()
-        
-        # Parse the inner data
-        info = extract_details(v_id, v_data)
-        if info["Name"]: # Validity Check
-            voters.append(info)
-            
-    return voters
+# --- 2. STATE MACHINE PARSING (New Strategy) ---
+def clean_id(text):
+    # Try to fix garbled IDs like 'svos40ass'
+    # 1. Remove non-alphanumeric
+    clean = re.sub(r'[^A-Z0-9]', '', text.upper())
+    # 2. Hard fixes for common OCR mistakes
+    clean = clean.replace('$', 'S').replace('O', '0')
+    return clean
 
-def extract_details(v_id, text):
-    data = {"ID": v_id, "Name": "", "Relation": "", "HouseNo": "", "Age": "", "Gender": ""}
-    
-    # Clean noise
-    text = text.replace("|", "").replace("!", "").replace("'", "")
-    
-    # 1. House Number
-    hn = re.search(r'House\s*Number\s*[:\-\.]\s*([0-9A-Za-z\-/]+)', text, re.IGNORECASE)
-    if hn: data["HouseNo"] = hn.group(1)
-    
-    # 2. Age & Gender
-    age = re.search(r'Age\s*[:\-\.]\s*(\d+)', text, re.IGNORECASE)
-    if age: data["Age"] = age.group(1)
-    
-    gen = re.search(r'Gender\s*[:\-\.]\s*([A-Za-z]+)', text, re.IGNORECASE)
-    if gen: 
-        g = gen.group(1).lower()
-        data["Gender"] = "Male" if "mal" in g and "fe" not in g else "Female"
-
-    # 3. Name & Relation
+def parse_strip_text(text):
     lines = [line.strip() for line in text.split('\n') if line.strip()]
-    for line in lines:
-        if any(x in line for x in ["House Number", "Age:", "Gender:", "Photo", "Avail", "Delet"]):
-            continue
+    
+    voters = []
+    current_voter = {}
+    
+    # Buffer to look backwards for ID
+    line_buffer = []
+    
+    for i, line in enumerate(lines):
+        # DETECT NEW VOTER (Anchor: "Name :" or "Narne :")
+        if re.match(r'(Name|Narne)\s*[:\-\.|]', line, re.IGNORECASE):
             
-        # Relation (Father/Husband/Mother)
-        if any(x in line for x in ["Father", "Husband", "Mother", "Other"]):
-            parts = re.split(r'[:\-]', line, 1)
+            # 1. Save Previous Voter (if exists)
+            if current_voter and current_voter.get("Name"):
+                voters.append(current_voter)
+            
+            # 2. Start New Voter
+            current_voter = {
+                "Name": "", "Relation": "", "HouseNo": "", 
+                "Age": "", "Gender": "", "ID": ""
+            }
+            
+            # 3. Extract Name
+            # Split by separator to get the name part
+            parts = re.split(r'[:\-\.|]', line, 1)
             if len(parts) > 1:
-                data["Relation"] = f"{parts[0].strip()}: {parts[1].strip()}"
-        
-        # Name (Look for "Name:" OR assume first line without numbers is Name)
-        elif not data["Name"]:
-            if "Name" in line or "Narne" in line:
-                parts = re.split(r'[:\-]', line, 1)
-                if len(parts) > 1: data["Name"] = parts[1].strip()
-            # Fallback: First generic text line is usually the Name
-            elif len(line) > 3 and not re.search(r'\d', line):
-                data["Name"] = line
+                current_voter["Name"] = parts[1].strip()
+            
+            # 4. HUNT FOR ID (Look Backwards 1-3 lines)
+            # The ID usually sits just above the Name or after "Available"
+            # We look for a "short alphanumeric string" (e.g., svos40ass)
+            found_id = False
+            for back_idx in range(1, 5): # Look back 4 lines
+                if i - back_idx >= 0:
+                    prev_line = lines[i - back_idx]
+                    
+                    # Ignore "Available", "Deleted", "Photo", "Section"
+                    if any(x in prev_line for x in ["Avail", "Delet", "Photo", "Sect", "Assem"]):
+                        continue
+                        
+                    # Candidate check: Short string (5-12 chars), contains digits
+                    # Example: "SMV0410241" or "svos40ass"
+                    clean_cand = clean_id(prev_line)
+                    if 5 <= len(clean_cand) <= 12 and any(c.isdigit() for c in clean_cand):
+                        current_voter["ID"] = clean_cand
+                        found_id = True
+                        break
+            
+            # If still no ID, mark as "Unknown" (Don't skip the voter!)
+            if not current_voter.get("ID"):
+                current_voter["ID"] = "UNREAD_ID"
+
+        # DETECT ATTRIBUTES (If we are inside a voter block)
+        elif current_voter:
+            # RELATION
+            if any(x in line for x in ["Father", "Husband", "Mother", "Other"]):
+                parts = re.split(r'[:\-\.|]', line, 1)
+                if len(parts) > 1:
+                    current_voter["Relation"] = f"{parts[0].strip()}: {parts[1].strip()}"
+            
+            # HOUSE NUMBER
+            elif "House Number" in line:
+                hn_match = re.search(r'Number\s*[:\-\.|]\s*([0-9A-Za-z\-/]+)', line, re.IGNORECASE)
+                if hn_match:
+                    current_voter["HouseNo"] = hn_match.group(1)
+            
+            # AGE & GENDER
+            elif "Age" in line or "Gender" in line:
+                age_match = re.search(r'Age\s*[:\-\.|]\s*(\d+)', line, re.IGNORECASE)
+                if age_match: current_voter["Age"] = age_match.group(1)
                 
-    return data
+                gen_match = re.search(r'Gender\s*[:\-\.|]\s*([A-Za-z]+)', line, re.IGNORECASE)
+                if gen_match:
+                    g = gen_match.group(1).lower()
+                    if "mal" in g and "fe" not in g: current_voter["Gender"] = "Male"
+                    elif "fe" in g: current_voter["Gender"] = "Female"
+
+    # Append the very last voter
+    if current_voter and current_voter.get("Name"):
+        voters.append(current_voter)
+        
+    return voters
 
 # --- 3. MAIN PROCESS ---
 def process_pdf(pdf_path, progress_bar=None):
     all_voters = []
     try:
-        # CRITICAL: dpi=300 ensures small text is readable
         images = convert_from_path(pdf_path, dpi=300)
     except Exception as e:
         return f"Error: {e}"
@@ -104,40 +126,32 @@ def process_pdf(pdf_path, progress_bar=None):
     total = len(images)
     for i, img_pil in enumerate(images):
         if progress_bar:
-            progress_bar.progress((i + 1) / total, text=f"Reading Page {i+1}/{total}...")
+            progress_bar.progress((i + 1) / total, text=f"Processing Page {i+1}...")
 
-        # 1. Get 3 vertical strips (Raw Grayscale)
         strips = get_vertical_strips(img_pil)
         
-        # 2. Process each strip
         for strip in strips:
-            # --psm 6 is "Assume a single uniform block of text"
-            raw_text = pytesseract.image_to_string(strip, config='--psm 6')
+            # Raw OCR (psm 6 is best for columns)
+            text = pytesseract.image_to_string(strip, config='--psm 6')
             
-            # 3. Mine data
-            voters = parse_raw_text_block(raw_text)
+            # Parse line-by-line
+            voters = parse_strip_text(text)
             all_voters.extend(voters)
                 
     return pd.DataFrame(all_voters)
 
-# --- DEBUG RUNNER ---
 if __name__ == "__main__":
     TEST_PDF = "goa.pdf"
     if os.path.exists(TEST_PDF):
-        print("🚀 Running Brute Force Stream Method...")
+        print("🚀 Running Name-Anchor Method...")
         df = process_pdf(TEST_PDF)
         
         if not df.empty:
-            print(f"✅ Success! Found {len(df)} voters.")
+            print(f"✅ Success! Extracted {len(df)} voters.")
             print(df.head(10))
-            df.to_excel("Final_BruteForce_Output.xlsx", index=False)
+            df.to_excel("Final_Output.xlsx", index=False)
         else:
-            print("❌ No data found. Tesseract output was empty.")
-            # Debug: Check one strip text
-            print("   Running diagnostic on first page...")
+            print("❌ Still no data. Showing raw text from first strip:")
             images = convert_from_path(TEST_PDF, dpi=300, first_page=1, last_page=1)
             strips = get_vertical_strips(images[0])
-            txt = pytesseract.image_to_string(strips[0], config='--psm 6')
-            print(f"   --- RAW TEXT SAMPLE ---\n{txt[:500]}\n   -----------------------")
-    else:
-        print("File 'goa.pdf' not found.")
+            print(pytesseract.image_to_string(strips[0], config='--psm 6')[:500])
