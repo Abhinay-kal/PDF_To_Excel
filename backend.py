@@ -46,3 +46,67 @@ if __name__ == "__main__":
         print("   - You should see white lines/text on a purely black background.")
     else:
         print(f"❌ Error: File '{TEST_PDF}' not found in this folder.")
+
+        # --- ADD THIS TO backend.py ---
+
+def detect_grid(thresh_img):
+    """
+    Accepts the binary threshold image (white on black).
+    Uses morphological kernels to isolate horizontal and vertical lines.
+    Returns a clean 'grid mask' containing ONLY the table structure.
+    """
+    # Define scale for the kernels. 
+    # Div 35 is a good starting point (e.g. for width 2000px, kernel is ~57px long).
+    # If lines are missed, decrease 35 to 25. If text is detected as lines, increase to 50.
+    horizontal_scale = 35
+    vertical_scale = 35
+    
+    # 1. Detect Vertical Lines
+    # Kernel shape: (1, height) -> A tall, thin stick.
+    v_len = thresh_img.shape[0] // vertical_scale
+    ver_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
+    # Morph Open: Erodes noise, then Dilates what remains.
+    vertical_lines = cv2.morphologyEx(thresh_img, cv2.MORPH_OPEN, ver_kernel, iterations=2)
+    
+    # 2. Detect Horizontal Lines
+    # Kernel shape: (width, 1) -> A long, flat stick.
+    h_len = thresh_img.shape[1] // horizontal_scale
+    hor_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
+    horizontal_lines = cv2.morphologyEx(thresh_img, cv2.MORPH_OPEN, hor_kernel, iterations=2)
+    
+    # 3. Combine
+    # Simple addition: Vertical + Horizontal = Grid
+    grid_mask = cv2.addWeighted(vertical_lines, 0.5, horizontal_lines, 0.5, 0.0)
+    
+    # 4. Refine (Optional but recommended)
+    # Apply a small dilation to close tiny gaps in the lines
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    grid_mask = cv2.dilate(grid_mask, kernel, iterations=1)
+    
+    # Threshold again to ensure strict binary (0 or 255)
+    _, grid_mask = cv2.threshold(grid_mask, 0, 255, cv2.THRESH_BINARY)
+    
+    return grid_mask
+
+# --- UPDATE THE TESTING BLOCK (At the bottom of backend.py) ---
+if __name__ == "__main__":
+    TEST_PDF = "temp_page 4 Goa.pdf"  # Use the same test PDF as before
+    
+    print(f"🔄 Processing Step 2 for: {TEST_PDF}")
+    
+    if os.path.exists(TEST_PDF):
+        pages = convert_from_path(TEST_PDF, first_page=1, last_page=1)
+        
+        # Step 1: Preprocess
+        processed_img, original_img = preprocess_page(pages[0])
+        
+        # Step 2: Detect Grid
+        grid_only = detect_grid(processed_img)
+        
+        # Save results
+        cv2.imwrite("debug_step2_grid.jpg", grid_only)
+        
+        print("✅ Step 2 Complete! Check 'debug_step2_grid.jpg'.")
+        print("   - You should see ONLY the table lines. No text.")
+    else:
+        print(f"❌ Error: File '{TEST_PDF}' not found.")
