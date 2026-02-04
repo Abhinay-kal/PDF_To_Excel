@@ -1,59 +1,112 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import os
-from backend import process_pdf # Import your function from Phase 2
+import io
+# Import the engine we built in previous steps
+from backend import process_pdf 
 
-# 1. Page Config
-st.set_page_config(page_title="Voter Roll OCR", page_icon="🗳️")
+# --- PAGE CONFIGURATION ---
+st.set_page_config(
+    page_title="Voter Roll Digitizer", 
+    page_icon="🗳️",
+    layout="centered"
+)
 
-st.title("🗳️ PDF to Excel Converter")
-st.markdown("Upload a scanned Electoral Roll to extract voter data automatically.")
+# --- CSS FOR UI POLISH ---
+st.markdown("""
+<style>
+    .stButton>button {
+        width: 100%;
+        background-color: #FF4B4B;
+        color: white;
+    }
+    .success-box {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        background-color: #D4EDDA;
+        color: #155724;
+        margin-bottom: 1rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# 2. File Uploader
-uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+# --- HEADER ---
+st.title("🗳️ Electoral Roll Converter")
+st.markdown("""
+Upload a **scanned PDF** of an Electoral Roll (Voter List). 
+This AI will detect the grid, read the text, fix typos, and generate a clean Excel file.
+""")
+
+# --- STEP 1: UPLOAD ---
+uploaded_file = st.file_uploader("Choose your PDF file", type=["pdf"])
 
 if uploaded_file is not None:
-    # Save the uploaded file temporarily because pdf2image needs a real path
+    # Save the uploaded file temporarily
+    # (pdf2image requires a physical file path to work)
     temp_path = f"temp_{uploaded_file.name}"
     with open(temp_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    st.success(f"File uploaded: {uploaded_file.name}")
-    
-    # 3. Process Button
-    if st.button("Start Conversion"):
-        with st.spinner("Scanning document... This may take a moment."):
-            try:
-                # Call the backend engine
-                df_result = process_pdf(temp_path)
+    st.info(f"📄 Loaded: {uploaded_file.name}")
+
+    # --- STEP 2: PROCESS BUTTON ---
+    if st.button("🚀 Start Extraction Engine"):
+        # Progress bar
+        progress_bar = st.progress(0, text="Initializing Computer Vision...")
+        
+        try:
+            # CALL THE BACKEND (The function we built in Phase 3)
+            df = process_pdf(temp_path, progress_bar)
+            
+            # --- STEP 3: OUTPUT & ASSEMBLY ---
+            if not df.empty:
+                # 1. Success Message
+                st.markdown(f"""
+                <div class="success-box">
+                    ✅ <b>Success!</b> Processed {len(df)} voters successfully.
+                </div>
+                """, unsafe_allow_html=True)
                 
-                # Check if we got data
-                if isinstance(df_result, pd.DataFrame) and not df_result.empty:
-                    st.success(f"Successfully extracted {len(df_result)} voters!")
+                # 2. Statistics (Phase 4 Value Add)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total Voters", len(df))
+                c2.metric("Male", len(df[df['Gender'] == 'Male']))
+                c3.metric("Female", len(df[df['Gender'] == 'Female']))
+                
+                # 3. Preview Data
+                st.subheader("📝 Data Preview")
+                st.dataframe(df.head(5))
+                
+                # 4. EXCEL CONSTRUCTION (In-Memory)
+                # We use BytesIO to create the file in RAM, so we don't clutter the hard drive
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                    df.to_excel(writer, index=False, sheet_name='Voter Data')
                     
-                    # 4. Preview Data
-                    st.dataframe(df_result.head())
-                    
-                    # 5. Download Button
-                    # Convert DF to Excel bytes
-                    # (Requires 'openpyxl' installed)
-                    excel_file = "voter_data.xlsx"
-                    df_result.to_excel(excel_file, index=False)
-                    
-                    with open(excel_file, "rb") as f:
-                        btn = st.download_button(
-                            label="📥 Download Excel File",
-                            data=f,
-                            file_name="Converted_Voter_List.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-                else:
-                    st.warning("No data found. The PDF might not be readable or the grid detection failed.")
-                    
-            except Exception as e:
-                st.error(f"An error occurred: {e}")
-            finally:
-                # Cleanup temp file
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+                    # Auto-adjust column width (Polish)
+                    worksheet = writer.sheets['Voter Data']
+                    for i, col in enumerate(df.columns):
+                        max_len = max(df[col].astype(str).map(len).max(), len(col)) + 2
+                        worksheet.set_column(i, i, max_len)
+                        
+                # Reset buffer position
+                buffer.seek(0)
+                
+                # 5. DOWNLOAD BUTTON
+                st.download_button(
+                    label="📥 Download Final Excel File",
+                    data=buffer,
+                    file_name="Converted_Voter_List.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                
+            else:
+                st.error("❌ No voters found. The grid detection might have failed (check image quality).")
+                
+        except Exception as e:
+            st.error(f"An error occurred: {e}")
+            
+        finally:
+            # Cleanup: Remove the temp PDF
+            if os.path.exists(temp_path):
+                os.remove(temp_path)

@@ -10,25 +10,49 @@ import os
 def preprocess_page(image_pil):
     img = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    
+    # STRATEGY 1: ADAPTIVE THRESHOLDING
+    # Instead of one global cutoff, we check local neighborhoods (15x15 pixel blocks).
+    # This catches faint lines that Otsu misses.
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, 
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY_INV, 
+        15, # Block Size (Area to look at)
+        5   # Constant (Sensitivity - Lower is more sensitive)
+    )
     return thresh, img
 
 # --- 2. GRID DETECTION ---
+
+
 def detect_grid(thresh_img):
-    horizontal_scale = 35
-    vertical_scale = 35
+    # STRATEGY 2: INCREASE SENSITIVITY TO BROKEN LINES
+    # We change divisor from 35 to 50. 
+    # This means a line only needs to be 1/50th of the page to count.
+    horizontal_scale = 60 
+    vertical_scale = 60
+    
     v_len = thresh_img.shape[0] // vertical_scale
     h_len = thresh_img.shape[1] // horizontal_scale
     
+    # Morphological kernels
     ver_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
     hor_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
     
+    # Find lines
     vertical_lines = cv2.morphologyEx(thresh_img, cv2.MORPH_OPEN, ver_kernel, iterations=2)
     horizontal_lines = cv2.morphologyEx(thresh_img, cv2.MORPH_OPEN, hor_kernel, iterations=2)
     
+    # Combine
     grid_mask = cv2.addWeighted(vertical_lines, 0.5, horizontal_lines, 0.5, 0.0)
-    grid_mask = cv2.dilate(grid_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
     
+    # STRATEGY 1 Extension: AGGRESSIVE GAP CLOSING
+    # Dilate 3 times to bridge any gaps in faint lines
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    grid_mask = cv2.dilate(grid_mask, kernel, iterations=3)
+    
+    # Final cleanup
     _, grid_mask = cv2.threshold(grid_mask, 0, 255, cv2.THRESH_BINARY)
     return grid_mask
 
@@ -73,11 +97,15 @@ def get_voter_boxes(grid_mask, original_img_shape):
     contours, _ = cv2.findContours(grid_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     valid_contours = []
     img_h, img_w = original_img_shape[:2]
-    min_width = img_w * 0.20 
+    
+    # Relaxed Thresholds
+    min_width = img_w * 0.08  # Dropped to 8% width
     
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
-        if w > min_width and h > 50 and w < (img_w * 0.9):
+        
+        # Lowered height requirement to 35px in case bottom line is cut
+        if w > min_width and h > 35 and w < (img_w * 0.9):
             valid_contours.append(c)
             
     return sort_contours(valid_contours)
@@ -201,8 +229,12 @@ def process_pdf(pdf_path, progress_bar=None):
 if __name__ == "__main__":
     TEST_PDF = "page 4 Goa (1).pdf"
     if os.path.exists(TEST_PDF):
-        print("Running Test with Cleaning & Validation...")
-        df = process_pdf(TEST_PDF)
-        df.to_excel("Cleaned_Voter_List.xlsx", index=False)
-        print("Done! Saved 'Cleaned_Voter_List.xlsx'")
-        print(df[["Name", "Gender", "Status"]].head(10))
+        pages = convert_from_path(TEST_PDF, first_page=1, last_page=1)
+        
+        # Run New Logic
+        thresh, img = preprocess_page(pages[0])
+        grid_mask = detect_grid(thresh)
+        
+        cv2.imwrite("debug_grid_mask.jpg", grid_mask)
+        print("Saved 'debug_grid_mask.jpg'. Open it!")
+        print("Do you see a clean grid for ALL 30 boxes? If lines are missing here, the OCR will fail.")

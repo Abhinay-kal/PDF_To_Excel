@@ -11,7 +11,7 @@ try:
     version = pytesseract.get_tesseract_version()
     print(f"✅ Tesseract Version: {version}")
 except Exception as e:
-    print("❌ Tesseract Error:", e)
+    print("❌ Tesseract -Error:", e)
 
 try:
     # Check if Poppler is found
