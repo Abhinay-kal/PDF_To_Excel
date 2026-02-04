@@ -6,7 +6,7 @@ import pandas as pd
 import re
 import os
 
-# --- 1. PRE-PROCESSING (No changes) ---
+# --- 1. PRE-PROCESSING ---
 def get_vertical_strips(image_pil):
     img = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -14,7 +14,7 @@ def get_vertical_strips(image_pil):
     img_h, img_w = gray.shape
     col_w = img_w // 3
     
-    # 3 strips with slight overlap
+    # Slice 3 vertical strips with overlap
     strips = [
         gray[0:img_h, 0 : col_w + 10],
         gray[0:img_h, col_w - 10 : col_w * 2 + 10],
@@ -22,73 +22,84 @@ def get_vertical_strips(image_pil):
     ]
     return strips
 
-# --- 2. STATE MACHINE PARSING (New Strategy) ---
+# --- 2. TEXT CLEANING ---
 def clean_id(text):
-    # Try to fix garbled IDs like 'svos40ass'
-    # 1. Remove non-alphanumeric
-    clean = re.sub(r'[^A-Z0-9]', '', text.upper())
-    # 2. Hard fixes for common OCR mistakes
-    clean = clean.replace('$', 'S').replace('O', '0')
+    # 1. Remove noise chars but keep spaces for now
+    text = text.upper()
+    
+    # 2. Fix common OCR digits-as-letters
+    # Only replace O with 0 if it looks like the numeric part of an ID
+    # (Simple approach: just replace all for ID candidate)
+    clean = text.replace('$', 'S').replace('O', '0').replace('I', '1').replace('B', '8')
+    
+    # 3. Strip everything except A-Z and 0-9
+    clean = re.sub(r'[^A-Z0-9]', '', clean)
     return clean
 
+def clean_typos(data):
+    if data["Gender"]:
+        g = data["Gender"].lower()
+        if "fem" in g: data["Gender"] = "Female"
+        elif "mal" in g: data["Gender"] = "Male"
+    return data
+
+# --- 3. PARSING LOGIC ---
 def parse_strip_text(text):
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     
     voters = []
     current_voter = {}
     
-    # Buffer to look backwards for ID
-    line_buffer = []
-    
     for i, line in enumerate(lines):
-        # DETECT NEW VOTER (Anchor: "Name :" or "Narne :")
-        if re.match(r'(Name|Narne)\s*[:\-\.|]', line, re.IGNORECASE):
+        # DETECT NAME (Anchor)
+        # Regex explanation:
+        # (Name|Narne|Nane) -> Matches common OCR typos
+        # [\W_]* -> Matches any garbage symbols like ' * ' or ' ? '
+        # [:\-\.|] -> Matches the separator
+        if re.match(r'(Name|Narne|Nane|Mame)[\W_]*[:\-\.|]', line, re.IGNORECASE):
             
-            # 1. Save Previous Voter (if exists)
+            # Save previous voter
             if current_voter and current_voter.get("Name"):
+                current_voter = clean_typos(current_voter)
                 voters.append(current_voter)
             
-            # 2. Start New Voter
             current_voter = {
                 "Name": "", "Relation": "", "HouseNo": "", 
-                "Age": "", "Gender": "", "ID": ""
+                "Age": "", "Gender": "", "ID": "UNREAD_ID"
             }
             
-            # 3. Extract Name
-            # Split by separator to get the name part
-            parts = re.split(r'[:\-\.|]', line, 1)
+            # Extract Name
+            # Use maxsplit=1 to avoid splitting on names that contain ':'
+            parts = re.split(r'[:\-\.|]', line, maxsplit=1)
             if len(parts) > 1:
                 current_voter["Name"] = parts[1].strip()
             
-            # 4. HUNT FOR ID (Look Backwards 1-3 lines)
-            # The ID usually sits just above the Name or after "Available"
-            # We look for a "short alphanumeric string" (e.g., svos40ass)
-            found_id = False
-            for back_idx in range(1, 5): # Look back 4 lines
+            # HUNT FOR ID (Look Backwards)
+            # We look back up to 6 lines to find the ID
+            for back_idx in range(1, 7): 
                 if i - back_idx >= 0:
                     prev_line = lines[i - back_idx]
                     
-                    # Ignore "Available", "Deleted", "Photo", "Section"
-                    if any(x in prev_line for x in ["Avail", "Delet", "Photo", "Sect", "Assem"]):
+                    # Skip common trash lines
+                    if any(x in prev_line for x in ["Avail", "Delet", "Photo", "Sect", "Assem", "Part"]):
                         continue
                         
-                    # Candidate check: Short string (5-12 chars), contains digits
-                    # Example: "SMV0410241" or "svos40ass"
+                    # Candidate Cleaning
                     clean_cand = clean_id(prev_line)
-                    if 5 <= len(clean_cand) <= 12 and any(c.isdigit() for c in clean_cand):
-                        current_voter["ID"] = clean_cand
-                        found_id = True
-                        break
-            
-            # If still no ID, mark as "Unknown" (Don't skip the voter!)
-            if not current_voter.get("ID"):
-                current_voter["ID"] = "UNREAD_ID"
+                    
+                    # Logic: Standard ID is 10 chars (3 Letters + 7 Numbers)
+                    # We accept 7-12 chars to be safe
+                    if 7 <= len(clean_cand) <= 12:
+                        # Strong signal: Starts with letters, ends with numbers
+                        # Or just a good length mix
+                        if re.match(r'^[A-Z]{3}', clean_cand):
+                            current_voter["ID"] = clean_cand
+                            break # Found it, stop looking
 
-        # DETECT ATTRIBUTES (If we are inside a voter block)
         elif current_voter:
             # RELATION
             if any(x in line for x in ["Father", "Husband", "Mother", "Other"]):
-                parts = re.split(r'[:\-\.|]', line, 1)
+                parts = re.split(r'[:\-\.|]', line, maxsplit=1)
                 if len(parts) > 1:
                     current_voter["Relation"] = f"{parts[0].strip()}: {parts[1].strip()}"
             
@@ -104,18 +115,16 @@ def parse_strip_text(text):
                 if age_match: current_voter["Age"] = age_match.group(1)
                 
                 gen_match = re.search(r'Gender\s*[:\-\.|]\s*([A-Za-z]+)', line, re.IGNORECASE)
-                if gen_match:
-                    g = gen_match.group(1).lower()
-                    if "mal" in g and "fe" not in g: current_voter["Gender"] = "Male"
-                    elif "fe" in g: current_voter["Gender"] = "Female"
+                if gen_match: current_voter["Gender"] = gen_match.group(1)
 
-    # Append the very last voter
+    # Save last voter
     if current_voter and current_voter.get("Name"):
+        current_voter = clean_typos(current_voter)
         voters.append(current_voter)
         
     return voters
 
-# --- 3. MAIN PROCESS ---
+# --- 4. MAIN PROCESS ---
 def process_pdf(pdf_path, progress_bar=None):
     all_voters = []
     try:
@@ -131,10 +140,7 @@ def process_pdf(pdf_path, progress_bar=None):
         strips = get_vertical_strips(img_pil)
         
         for strip in strips:
-            # Raw OCR (psm 6 is best for columns)
             text = pytesseract.image_to_string(strip, config='--psm 6')
-            
-            # Parse line-by-line
             voters = parse_strip_text(text)
             all_voters.extend(voters)
                 
@@ -143,15 +149,14 @@ def process_pdf(pdf_path, progress_bar=None):
 if __name__ == "__main__":
     TEST_PDF = "goa.pdf"
     if os.path.exists(TEST_PDF):
-        print("🚀 Running Name-Anchor Method...")
+        print("🚀 Running Final Polished Method...")
         df = process_pdf(TEST_PDF)
         
         if not df.empty:
             print(f"✅ Success! Extracted {len(df)} voters.")
-            print(df.head(10))
-            df.to_excel("Final_Output.xlsx", index=False)
+            print(df[["ID", "Name", "Age"]].head(10))
+            df.to_excel("Final_Clean_Output.xlsx", index=False)
         else:
-            print("❌ Still no data. Showing raw text from first strip:")
-            images = convert_from_path(TEST_PDF, dpi=300, first_page=1, last_page=1)
-            strips = get_vertical_strips(images[0])
-            print(pytesseract.image_to_string(strips[0], config='--psm 6')[:500])
+            print("❌ No data found.")
+    else:
+        print("File not found.")
