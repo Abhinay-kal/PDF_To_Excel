@@ -1,99 +1,48 @@
-# backend.py
+# backend.py - PART 1: Pre-processing
 import cv2
 import numpy as np
-import pytesseract
-import pandas as pd
 from pdf2image import convert_from_path
-import re
+import os
 
-def parse_voter_text(text):
+def preprocess_page(image_pil):
     """
-    Regex logic to extract data from raw OCR text.
+    Accepts a PIL image (from pdf2image), converts to OpenCV format,
+    and applies Grayscale -> Threshold -> Inversion.
+    Returns the processed binary image and the original OpenCV image.
     """
-    # Regex patterns based on the Goa voter roll format
-    data = {}
-    
-    # 1. Voter ID (e.g., SMV0334946)
-    id_match = re.search(r'([A-Z]{3}\d{7})', text)
-    data['VoterID'] = id_match.group(1) if id_match else "N/A"
-    
-    # 2. House Number
-    house_match = re.search(r'House\s*Number\s*[:\-\.]\s*([0-9A-Za-z\-/]+)', text, re.IGNORECASE)
-    data['HouseNo'] = house_match.group(1) if house_match else ""
-    
-    # 3. Age & Gender
-    age_match = re.search(r'Age\s*[:\-\.]\s*(\d+)', text, re.IGNORECASE)
-    gender_match = re.search(r'Gender\s*[:\-\.]\s*(Male|Female)', text, re.IGNORECASE)
-    
-    data['Age'] = age_match.group(1) if age_match else ""
-    data['Gender'] = gender_match.group(1) if gender_match else ""
-    
-    # 4. Name (This is tricky, usually the first non-empty line after cleaning)
-    lines = [line for line in text.split('\n') if line.strip()]
-    # Simple heuristic: Look for lines that don't start with metadata keys
-    for line in lines:
-        if "Name" in line and "Father" not in line and "Husband" not in line:
-            data['Name'] = line.replace("Name:", "").strip()
-            break
-            
-    return data
+    # 1. Convert PIL to OpenCV (BGR)
+    img = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
 
-def process_pdf(pdf_file_path):
-    """
-    Main function: Input PDF path -> Output Pandas DataFrame
-    """
-    final_data = []
+    # 2. Convert to Grayscale
+    # Purpose: Reduces file size and noise; color is irrelevant for structure.
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 3. Binary Thresholding + Inversion
+    # cv2.THRESH_BINARY_INV: Turns the background BLACK and lines/text WHITE.
+    # cv2.THRESH_OTSU: Automatically finds the best "cutoff" point to separate ink from paper.
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+
+    return thresh, img
+
+# --- TESTING BLOCK (Run this file directly to check Step 1) ---
+if __name__ == "__main__":
+    # Replace this with your actual PDF filename for testing
+    TEST_PDF = "temp_page 4 Goa.pdf" 
     
-    # 1. Convert PDF to Images
-    try:
-        images = convert_from_path(pdf_file_path)
-    except Exception as e:
-        return f"Error: {e}"
-
-    for page_num, img_pil in enumerate(images):
-        # Convert to OpenCV format
-        img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    print(f"🔄 Processing Step 1 for: {TEST_PDF}")
+    
+    if os.path.exists(TEST_PDF):
+        # Convert just the first page for the test
+        pages = convert_from_path(TEST_PDF, first_page=1, last_page=1)
         
-        # 2. Thresholding
-        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-
-        # 3. Grid Detection (The "Chopper")
-        # Define kernels based on image size
-        h_len = img.shape[1] // 35
-        v_len = img.shape[0] // 35
+        # Run the function
+        processed_img, original_img = preprocess_page(pages[0])
         
-        ver_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_len))
-        hor_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_len, 1))
+        # Save the result so you can see it
+        output_filename = "debug_step1_inverted.jpg"
+        cv2.imwrite(output_filename, processed_img)
         
-        img_v = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, ver_kernel, iterations=2)
-        img_h = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, hor_kernel, iterations=2)
-        
-        grid_mask = cv2.addWeighted(img_v, 0.5, img_h, 0.5, 0.0)
-        
-        # 4. Find Contours (Boxes)
-        contours, _ = cv2.findContours(grid_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Sort contours top-to-bottom, then left-to-right (Crucial for correct order)
-        # (Simplified sorting for now - usually requires a custom sort key)
-        contours = sorted(contours, key=lambda ctr: cv2.boundingRect(ctr)[1]) 
-
-        for c in contours:
-            x, y, w, h = cv2.boundingRect(c)
-            
-            # Filter valid voter boxes
-            if w > 100 and h > 50 and w < (img.shape[1] * 0.9):
-                # Crop
-                roi = img[y:y+h, x:x+w]
-                
-                # 5. OCR
-                text = pytesseract.image_to_string(roi)
-                
-                # 6. Parse
-                extracted = parse_voter_text(text)
-                if extracted.get('VoterID') != "N/A": # Only add if it looks like a voter
-                    final_data.append(extracted)
-
-    # 7. Create DataFrame
-    df = pd.DataFrame(final_data)
-    return df
+        print(f"✅ Step 1 Complete! Check '{output_filename}'.")
+        print("   - You should see white lines/text on a purely black background.")
+    else:
+        print(f"❌ Error: File '{TEST_PDF}' not found in this folder.")
