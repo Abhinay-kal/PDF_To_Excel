@@ -192,39 +192,3 @@ def process_pdf(pdf_path, progress_bar=None):
     return pd.DataFrame(list(unique.values()))
 
 # ==========================================
-#        UI
-# ==========================================
-
-st.title("🧬 Dual-Anchor Extraction Engine")
-st.markdown("### Strategy: Duplicate & Merge")
-st.info("Scans for IDs and Names independently, creating duplicate candidates, then intelligently merges them based on spatial proximity.")
-
-uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
-
-if uploaded_file:
-    temp_path = f"temp_{uploaded_file.name}"
-    with open(temp_path, "wb") as f: f.write(uploaded_file.getbuffer())
-    
-    if st.button("🚀 Run Dual-Core Extraction"):
-        bar = st.progress(0, "Starting...")
-        df = process_pdf(temp_path, bar)
-        bar.empty()
-        os.remove(temp_path)
-        
-        if not df.empty:
-            st.success(f"✅ Extracted {len(df)} Unique Voters")
-            
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total", len(df))
-            c2.metric("Valid IDs", len(df[df['ID'] != 'UNREAD']))
-            c3.metric("Missing IDs", len(df[df['ID'] == 'UNREAD']))
-            
-            st.dataframe(df.head(10), use_container_width=True)
-            
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False)
-            buffer.seek(0)
-            st.download_button("📥 Download Excel", buffer, "Dual_Anchor_Output.xlsx")
-        else:
-            st.error("No data found.")
